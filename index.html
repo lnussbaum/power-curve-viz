@@ -1,0 +1,714 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Power Curve Viewer</title>
+<!--
+  Power Curve Viewer — Single-page application for visualizing cycling power curves.
+
+  Expected CSV format:
+    - First column: "secs" (duration in seconds)
+    - Remaining columns: power values (in watts) for different time periods/conditions
+    - Missing values are represented as empty cells and are skipped during rendering
+
+  Architecture:
+    - No build step or server required; runs entirely in the browser
+    - Plotly.js (loaded from CDN) handles chart rendering, hover tooltips, zoom/pan
+    - Data is pasted by the user on first visit, then cached in localStorage
+    - All state (filters, visibility) is ephemeral; only raw CSV text is persisted
+-->
+<script src="https://cdn.plot.ly/plotly-2.35.0.min.js"></script>
+<style>
+  /* ── Reset & base ───────────────────────────────────────────────
+     Full-viewport layout, dark theme, system font stack            */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #111; color: #eee; }
+
+  /* ── Paste screen ───────────────────────────────────────────────
+     Centered form shown on first visit (or when user clicks        */
+  #paste-screen {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    height: 100%; padding: 2rem; gap: 1rem;
+  }
+  #paste-screen h1 { font-size: 1.5rem; font-weight: 600; }
+  #csv-input {
+    width: 100%; max-width: 800px; height: 300px; padding: 0.75rem;
+    background: #1a1a1a; color: #eee; border: 1px solid #333; border-radius: 6px;
+    font-family: monospace; font-size: 0.85rem; resize: vertical;
+  }
+  #load-btn {
+    padding: 0.6rem 2rem; font-size: 1rem; background: #3b82f6; color: #fff;
+    border: none; border-radius: 6px; cursor: pointer; font-weight: 500;
+  }
+  #load-btn:disabled { background: #555; cursor: default; }
+  #error-msg { color: #ef4444; font-size: 0.9rem; min-height: 1.2rem; }
+
+  /* ── Chart screen ───────────────────────────────────────────────
+     Flex column: controls bar on top, chart fills remaining space  */
+  #chart-screen { display: none; flex-direction: column; height: 100%; }
+
+  /* ── Controls bar ───────────────────────────────────────────────
+     Wrapping row of all UI controls; dark background, subtle border */
+  #controls {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem 1.5rem;
+    padding: 0.5rem 1rem; background: #1a1a1a; border-bottom: 1px solid #333;
+    font-size: 0.85rem;
+  }
+  #controls label { display: flex; align-items: center; gap: 0.3rem; cursor: pointer; white-space: nowrap; }
+  #controls input[type="checkbox"] { accent-color: #3b82f6; }
+  .control-group { display: flex; align-items: center; gap: 0.4rem; }
+  .control-group span { color: #999; }
+
+  /* ── Slider groups ──────────────────────────────────────────────
+     Consistent sizing for duration and power range sliders          */
+  #min-duration-group, #max-duration-group, #min-power-group, #max-power-group { display: flex; align-items: center; gap: 0.4rem; }
+  #min-duration-group input[type="range"], #max-duration-group input[type="range"], #min-power-group input[type="range"], #max-power-group input[type="range"] { width: 120px; accent-color: #3b82f6; }
+  #min-duration-label, #max-duration-label, #min-power-label, #max-power-label { min-width: 60px; color: #ccc; font-variant-numeric: tabular-nums; }
+
+  /* ── Action buttons ─────────────────────────────────────────────
+     Pushed to the right via margin-left: auto                       */
+  #change-data-btn, #export-btn {
+    margin-left: auto; padding: 0.3rem 0.8rem; background: transparent; color: #999;
+    border: 1px solid #555; border-radius: 4px; cursor: pointer; font-size: 0.8rem;
+  }
+  #change-data-btn:hover, #export-btn:hover { color: #eee; border-color: #999; }
+
+  /* ── Select All / None button ─────────────────────────────────── */
+  #select-all-btn {
+    padding: 0.15rem 0.5rem; background: transparent; color: #999;
+    border: 1px solid #444; border-radius: 3px; cursor: pointer; font-size: 0.75rem;
+  }
+  #select-all-btn:hover { color: #eee; border-color: #888; }
+
+  /* ── Plot container ─────────────────────────────────────────────
+     Flex-grow: 1 ensures it takes all remaining vertical space      */
+  #plot { flex: 1; min-height: 0; }
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════════════
+     PASTE SCREEN
+     Shown when no data is cached. User pastes CSV and clicks Load.
+     ═══════════════════════════════════════════════════════════ -->
+<div id="paste-screen">
+  <h1>Power Curve Viewer</h1>
+  <textarea id="csv-input" placeholder="Paste your CSV data here..."></textarea>
+  <button id="load-btn" disabled>Load Data</button>
+  <div id="error-msg"></div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     CHART SCREEN
+     Contains the control bar and the Plotly chart div.
+     ═══════════════════════════════════════════════════════════ -->
+<div id="chart-screen">
+  <div id="controls">
+    <!-- Column visibility toggles; "All" button prepended inside -->
+    <div id="column-toggles">
+      <button id="select-all-btn">All</button>
+    </div>
+    <!-- X-axis scale toggle -->
+    <div class="control-group">
+      <span>X-axis:</span>
+      <label><input type="checkbox" id="x-log" checked> Log</label>
+    </div>
+    <!-- Y-axis scale toggle -->
+    <div class="control-group">
+      <span>Y-axis:</span>
+      <label><input type="checkbox" id="y-log" checked> Log</label>
+    </div>
+    <!-- Duration range: minimum -->
+    <div id="min-duration-group">
+      <span>Min:</span>
+      <input type="range" id="min-duration" min="0" max="0" value="0">
+      <span id="min-duration-label">1s</span>
+    </div>
+    <!-- Duration range: maximum -->
+    <div id="max-duration-group">
+      <span>Max:</span>
+      <input type="range" id="max-duration" min="0" max="0" value="0">
+      <span id="max-duration-label">1s</span>
+    </div>
+    <!-- Power range: minimum -->
+    <div id="min-power-group">
+      <span>Min W:</span>
+      <input type="range" id="min-power" min="0" max="1000" value="0">
+      <span id="min-power-label">0</span>
+    </div>
+    <!-- Power range: maximum -->
+    <div id="max-power-group">
+      <span>Max W:</span>
+      <input type="range" id="max-power" min="0" max="1000" value="1000">
+      <span id="max-power-label">1000</span>
+    </div>
+    <!-- Export current chart as PNG -->
+    <button id="export-btn">Export PNG</button>
+    <!-- Clear cached data and return to paste screen -->
+    <button id="change-data-btn">Change data</button>
+  </div>
+  <div id="plot"></div>
+</div>
+
+<script>
+// ──────────────────────────────────────────────────────────────
+// CONSTANTS & STATE
+// ──────────────────────────────────────────────────────────────
+
+/** localStorage key for caching the raw CSV text between visits */
+const STORAGE_KEY = 'powerCurveData';
+
+/** Parsed data object: { secs: number[], columns: { [name]: (number|null)[] }, headers: string[] } */
+let parsedData = null;
+
+/** Column header names (derived from CSV, used to build toggle labels) */
+let columnNames = [];
+
+/**
+ * Distinct line colors for up to 15 curves.
+ * Each column is assigned a color by its index (mod length),
+ * ensuring the same column always gets the same color.
+ */
+const COLORS = [
+  '#636efa', '#EF553B', '#00cc96', '#ab63fa', '#FFA15A',
+  '#19d3f3', '#FF6692', '#B6E880', '#FF97FF', '#FECB52',
+  '#80b3ff', '#e5a8ff', '#a3ffb3', '#ffb3a3', '#b3d9ff',
+];
+
+// ──────────────────────────────────────────────────────────────
+// DOM REFERENCES
+// Cached once at startup to avoid repeated querySelector calls.
+// ──────────────────────────────────────────────────────────────
+const csvInput = document.getElementById('csv-input');
+const loadBtn = document.getElementById('load-btn');
+const errorMsg = document.getElementById('error-msg');
+const pasteScreen = document.getElementById('paste-screen');
+const chartScreen = document.getElementById('chart-screen');
+const columnToggles = document.getElementById('column-toggles');
+const xLogCheck = document.getElementById('x-log');
+const yLogCheck = document.getElementById('y-log');
+const minDurationSlider = document.getElementById('min-duration');
+const minDurationLabel = document.getElementById('min-duration-label');
+const maxDurationSlider = document.getElementById('max-duration');
+const maxDurationLabel = document.getElementById('max-duration-label');
+const minPowerSlider = document.getElementById('min-power');
+const minPowerLabel = document.getElementById('min-power-label');
+const maxPowerSlider = document.getElementById('max-power');
+const maxPowerLabel = document.getElementById('max-power-label');
+const changeDataBtn = document.getElementById('change-data-btn');
+const exportBtn = document.getElementById('export-btn');
+const selectAllBtn = document.getElementById('select-all-btn');
+
+// ──────────────────────────────────────────────────────────────
+// FORMATTING HELPERS
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * Converts seconds to a human-readable duration string.
+ * Examples: 5 → "5s", 90 → "1m30s", 3600 → "1h", 5400 → "1h30"
+ * Omits zero-valued components for brevity.
+ */
+function formatDuration(secs) {
+  if (secs < 60) return secs + 's';
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  if (h > 0) return h + 'h' + (m > 0 ? m : '');
+  return m + 'm' + (s > 0 ? s + 's' : '');
+}
+
+// ──────────────────────────────────────────────────────────────
+// X-AXIS TICK GENERATION
+//
+// Two-tier system:
+//   1. "Labeled" ticks — cycling-friendly durations (1m, 5m, 1h…)
+//      with human-readable text. Key durations are always shown.
+//   2. "Data" ticks — unlabeled minor ticks at every ~30s interval
+//      so Plotly can snap the hover crosshair to real data points.
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * Predefined "nice" durations in seconds.
+ * Covers the full range of typical cycling efforts:
+ *   seconds → minutes → hours, with cycling-relevant intervals.
+ */
+const NICE_DURATIONS = [
+  1, 2, 3, 5, 10, 15, 20, 30, 45,
+  60, 90, 120, 150, 180, 240, 300, 480, 600, 900,
+  1200, 1500, 1800, 2400, 2700, 3000, 3600,
+  4500, 5400, 6000, 7200, 9000, 10800, 12600, 14400, 16200, 18000, 21600,
+];
+
+/**
+ * "Key" durations that should always appear as labeled ticks
+ * regardless of how many other ticks are present.
+ * These represent round time milestones cyclists care about.
+ */
+const KEY_DURATIONS = new Set([60, 300, 600, 1800, 3600, 7200, 10800, 21600]);
+
+/**
+ * Generates labeled X-axis tick positions and labels.
+ *
+ * Strategy:
+ *   1. Filter NICE_DURATIONS to the visible range [minVal, maxVal].
+ *   2. Separate into "key" (always shown) and "others".
+ *   3. If "others" exceed the budget (28 total minus key count),
+ *      subsample evenly.
+ *   4. Merge and sort, then format each value.
+ *
+ * This guarantees key milestones are never dropped while keeping
+ * the total tick count manageable on any screen size.
+ */
+function generateXTicks(minVal, maxVal) {
+  const inRange = NICE_DURATIONS.filter(v => v >= minVal && v <= maxVal);
+  if (inRange.length === 0) return { vals: [minVal, maxVal], texts: [formatDuration(minVal), formatDuration(maxVal)] };
+
+  const keys = inRange.filter(v => KEY_DURATIONS.has(v));
+  const others = inRange.filter(v => !KEY_DURATIONS.has(v));
+  const maxOthers = 28 - keys.length;
+
+  let sampledOthers;
+  if (others.length <= maxOthers) {
+    sampledOthers = others;
+  } else {
+    const step = Math.ceil(others.length / maxOthers);
+    sampledOthers = [];
+    for (let i = 0; i < others.length; i += step) sampledOthers.push(others[i]);
+  }
+
+  const combined = [...keys, ...sampledOthers].sort((a, b) => a - b);
+  return { vals: combined, texts: combined.map(formatDuration) };
+}
+
+/**
+ * Generates unlabeled minor tick positions from the actual data.
+ *
+ * Instead of creating a tick for every single data point (which
+ * could be 200+ and slow rendering), we place a minor tick every
+ * ~30 seconds. This gives Plotly enough anchor points to snap the
+ * hover crosshair to real data without overwhelming the axis.
+ */
+function getDataTicks(secs, minIdx, maxIdx) {
+  const ticks = [];
+  const texts = [];
+  for (let i = minIdx; i <= maxIdx; i++) {
+    const s = secs[i];
+    const prev = ticks.length > 0 ? ticks[ticks.length - 1] : -1;
+    const gap = s - prev;
+    if (gap >= 30 || ticks.length === 0) {
+      ticks.push(s);
+      texts.push('');
+    }
+  }
+  return { vals: ticks, texts };
+}
+
+/**
+ * Merges labeled and unlabeled tick arrays into a single sorted list.
+ *
+ * Labeled ticks take priority (they keep their text). Unlabeled ticks
+ * are inserted at their numeric position with an empty text string,
+ * which Plotly renders as a minor grid line without a label.
+ */
+function mergeTicks(labeled, allData) {
+  const labeledSet = new Set(labeled.vals);
+  const mergedVals = [...labeled.vals];
+  const mergedTexts = [...labeled.texts];
+  for (let i = 0; i < allData.vals.length; i++) {
+    if (!labeledSet.has(allData.vals[i])) {
+      mergedVals.push(allData.vals[i]);
+      mergedTexts.push('');
+    }
+  }
+  const combined = mergedVals.map((v, i) => ({ val: v, text: mergedTexts[i] }));
+  combined.sort((a, b) => a.val - b.val);
+  return { vals: combined.map(c => c.val), texts: combined.map(c => c.text) };
+}
+
+// ──────────────────────────────────────────────────────────────
+// CSV PARSING
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * Parses raw CSV text into a structured data object.
+ *
+ * Expected format:
+ *   secs,Column A,Column B,...
+ *   1,500,480,...
+ *   2,490,470,...
+ *
+ * Handles:
+ *   - BOM character (common in Excel exports)
+ *   - Quoted header names
+ *   - Empty cells (stored as null)
+ *   - Non-numeric rows (skipped)
+ *
+ * Returns: { secs: number[], columns: { [header]: (number|null)[] }, headers: string[] }
+ */
+function parseCSV(text) {
+  text = text.replace(/^\uFEFF/, '').trim();
+  const lines = text.split(/\r?\n/);
+  if (lines.length < 2) throw new Error('CSV must have a header row and at least one data row');
+
+  const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+  if (headers[0].toLowerCase() !== 'secs') throw new Error('First column must be "secs"');
+
+  const cols = {};
+  for (let i = 1; i < headers.length; i++) cols[headers[i]] = [];
+  const secs = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const vals = lines[i].split(',');
+    const s = parseFloat(vals[0]);
+    if (isNaN(s)) continue;
+    secs.push(s);
+    for (let j = 1; j < headers.length; j++) {
+      const v = vals[j] !== undefined && vals[j].trim() !== '' ? parseFloat(vals[j]) : null;
+      cols[headers[j]].push(v);
+    }
+  }
+
+  if (secs.length === 0) throw new Error('No valid data rows found');
+  return { secs, columns: cols, headers: headers.slice(1) };
+}
+
+// ──────────────────────────────────────────────────────────────
+// POWER RANGE CALCULATION
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * Scans all visible columns within the selected duration range
+ * to find the min and max power values.
+ *
+ * Only considers columns whose checkboxes are currently checked,
+ * so hiding a column removes its influence on the Y-axis range.
+ *
+ * Falls back to 50–1000W if no valid data exists (e.g., all cells
+ * are null in the selected range).
+ */
+function getVisiblePowerRange(data, minIdx, maxIdx, visibleHeaders) {
+  let globalMin = Infinity, globalMax = -Infinity;
+  for (const name of visibleHeaders) {
+    for (let i = minIdx; i <= maxIdx; i++) {
+      const v = data.columns[name][i];
+      if (v !== null) {
+        if (v < globalMin) globalMin = v;
+        if (v > globalMax) globalMax = v;
+      }
+    }
+  }
+  if (globalMin === Infinity) return { pMin: 50, pMax: 1000 };
+  return {
+    pMin: Math.floor(globalMin / 10) * 10,
+    pMax: Math.ceil(globalMax / 10) * 10,
+  };
+}
+
+/**
+ * Returns the list of column headers whose checkboxes are checked.
+ * Used by getVisiblePowerRange to filter which columns to scan.
+ */
+function getVisibleHeaders() {
+  const checkboxes = columnToggles.querySelectorAll('input[type="checkbox"]');
+  const headers = [];
+  checkboxes.forEach((cb, i) => {
+    if (cb.checked && parsedData.headers[i]) headers.push(parsedData.headers[i]);
+  });
+  return headers;
+}
+
+/**
+ * Updates the min/max power sliders to match the data range of the
+ * currently visible columns within the selected duration range.
+ *
+ * Called whenever:
+ *   - Duration sliders change (data range shifts)
+ *   - Column checkboxes change (visible set changes)
+ *   - Data is first loaded
+ */
+function updatePowerSliderRanges() {
+  const minIdx = parseInt(minDurationSlider.value);
+  const maxIdx = parseInt(maxDurationSlider.value);
+  const visibleHeaders = getVisibleHeaders();
+  const { pMin, pMax } = getVisiblePowerRange(parsedData, minIdx, maxIdx, visibleHeaders);
+  minPowerSlider.min = pMin;
+  minPowerSlider.max = pMax;
+  minPowerSlider.value = pMin;
+  maxPowerSlider.min = pMin;
+  maxPowerSlider.max = pMax;
+  maxPowerSlider.value = pMax;
+  minPowerLabel.textContent = pMin;
+  maxPowerLabel.textContent = pMax;
+}
+
+// ──────────────────────────────────────────────────────────────
+// CHART INITIALIZATION (showChart)
+//
+// Called once when data is loaded. Sets up all UI controls,
+ // attaches event listeners, and triggers the first render.
+// ──────────────────────────────────────────────────────────────
+
+function showChart(data) {
+  parsedData = data;
+  columnNames = data.headers;
+  pasteScreen.style.display = 'none';
+  chartScreen.style.display = 'flex';
+
+  // ── Build column toggle checkboxes with color swatches ──
+  columnToggles.innerHTML = '';
+  const selectBtn = document.createElement('button');
+  selectBtn.id = 'select-all-btn';
+  selectBtn.textContent = 'All';
+  columnToggles.appendChild(selectBtn);
+
+  let allChecked = true;
+  columnNames.forEach((name, i) => {
+    const label = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = true;
+    cb.dataset.index = i;
+    // Re-render chart and update power range when visibility changes
+    cb.addEventListener('change', () => { updatePowerSliderRanges(); renderChart(); });
+    // Color swatch matching the line color for this column
+    const swatch = document.createElement('span');
+    swatch.style.cssText = 'display:inline-block;width:10px;height:10px;border-radius:2px;background:' + COLORS[i % COLORS.length] + ';flex-shrink:0;';
+    label.appendChild(cb);
+    label.appendChild(swatch);
+    // Truncate long names for display; full name on hover
+    label.appendChild(document.createTextNode(name.length > 25 ? name.slice(0, 22) + '...' : name));
+    label.title = name;
+    columnToggles.appendChild(label);
+  });
+
+  // ── Select All / None toggle ──
+  selectBtn.onclick = () => {
+    allChecked = !allChecked;
+    selectBtn.textContent = allChecked ? 'All' : 'None';
+    const checkboxes = columnToggles.querySelectorAll('input[type="checkbox"]');
+    checkboxes.forEach(cb => { cb.checked = allChecked; });
+    updatePowerSliderRanges();
+    renderChart();
+  };
+
+  // ── Configure duration sliders ──
+  // Sliders use array indices (not seconds) so they map directly to data rows
+  minDurationSlider.max = data.secs.length - 1;
+  minDurationSlider.value = 0;
+  maxDurationSlider.max = data.secs.length - 1;
+  maxDurationSlider.value = data.secs.length - 1;
+  minDurationLabel.textContent = formatDuration(data.secs[0]);
+  maxDurationLabel.textContent = formatDuration(data.secs[data.secs.length - 1]);
+
+  // Initialize power sliders to match full data range
+  updatePowerSliderRanges();
+
+  // ── Min duration slider ──
+  // Prevents crossing the max slider; updates label and re-renders
+  minDurationSlider.oninput = () => {
+    let idx = parseInt(minDurationSlider.value);
+    if (idx > parseInt(maxDurationSlider.value)) {
+      idx = parseInt(maxDurationSlider.value);
+      minDurationSlider.value = idx;
+    }
+    minDurationLabel.textContent = formatDuration(data.secs[idx]);
+    updatePowerSliderRanges();
+    renderChart();
+  };
+
+  // ── Max duration slider ──
+  // Prevents crossing the min slider; updates label and re-renders
+  maxDurationSlider.oninput = () => {
+    let idx = parseInt(maxDurationSlider.value);
+    if (idx < parseInt(minDurationSlider.value)) {
+      idx = parseInt(minDurationSlider.value);
+      maxDurationSlider.value = idx;
+    }
+    maxDurationLabel.textContent = formatDuration(data.secs[idx]);
+    updatePowerSliderRanges();
+    renderChart();
+  };
+
+  // ── Scale toggles ──
+  xLogCheck.onchange = renderChart;
+  yLogCheck.onchange = renderChart;
+
+  // ── Min power slider ──
+  // Prevents crossing the max slider; updates label and re-renders
+  minPowerSlider.oninput = () => {
+    let v = parseInt(minPowerSlider.value);
+    if (v > parseInt(maxPowerSlider.value)) {
+      v = parseInt(maxPowerSlider.value);
+      minPowerSlider.value = v;
+    }
+    minPowerLabel.textContent = v;
+    renderChart();
+  };
+
+  // ── Max power slider ──
+  // Prevents crossing the min slider; updates label and re-renders
+  maxPowerSlider.oninput = () => {
+    let v = parseInt(maxPowerSlider.value);
+    if (v < parseInt(minPowerSlider.value)) {
+      v = parseInt(minPowerSlider.value);
+      maxPowerSlider.value = v;
+    }
+    maxPowerLabel.textContent = v;
+    renderChart();
+  };
+
+  // Initial render
+  renderChart();
+}
+
+// ──────────────────────────────────────────────────────────────
+// CHART RENDERING (renderChart)
+//
+// Called on every state change (filter, visibility, scale).
+// Builds Plotly traces from the current filtered data and calls
+// Plotly.react() for efficient in-place updates.
+// ──────────────────────────────────────────────────────────────
+
+function renderChart() {
+  if (!parsedData) return;
+  const { secs, columns, headers } = parsedData;
+  const minIdx = parseInt(minDurationSlider.value);
+  const maxIdx = parseInt(maxDurationSlider.value);
+  const xSlice = secs.slice(minIdx, maxIdx + 1);
+
+  // ── Build one trace per visible column ──
+  // Each trace is a line chart (scatter + mode:'lines').
+  // Null values are excluded so gaps appear where data is missing.
+  const traces = [];
+  const checkboxes = columnToggles.querySelectorAll('input[type="checkbox"]');
+  checkboxes.forEach((cb, i) => {
+    if (!cb.checked) return;
+    const ySlice = columns[headers[i]].slice(minIdx, maxIdx + 1).map(v => v);
+    const x = [], y = [];
+    for (let j = 0; j < xSlice.length; j++) {
+      if (ySlice[j] !== null) { x.push(xSlice[j]); y.push(ySlice[j]); }
+    }
+    if (x.length === 0) return;
+    const color = COLORS[i % COLORS.length];
+    traces.push({
+      x, y, type: 'scatter', mode: 'lines', name: headers[i],
+      line: { width: 2, color },
+      // Hover tooltip: column name, formatted duration, power value
+      hovertemplate: '<b>' + headers[i] + '</b><br>%{customdata}<br>Power: %{y:.0f} W<extra></extra>',
+      customdata: x.map(s => formatDuration(s)),
+    });
+  });
+
+  // ── Compute X-axis tick positions ──
+  const xMin = xSlice.length > 0 ? xSlice[0] : 1;
+  const xMax = xSlice.length > 0 ? xSlice[xSlice.length - 1] : 100;
+  const xLabeled = generateXTicks(xMin, xMax);
+  const xAllData = getDataTicks(secs, minIdx, maxIdx);
+  const xTicks = mergeTicks(xLabeled, xAllData);
+
+  // ── Build Plotly layout ──
+  const layout = {
+    paper_bgcolor: '#111', plot_bgcolor: '#111',
+    font: { color: '#ccc', family: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif' },
+    xaxis: {
+      title: { text: 'Duration', font: { color: '#999' } },
+      type: xLogCheck.checked ? 'log' : 'linear',
+      gridcolor: '#222', zerolinecolor: '#333',
+      tickfont: { size: 11 },
+      tickvals: xTicks.vals,
+      ticktext: xTicks.texts,
+    },
+    yaxis: {
+      title: { text: 'Power (W)', font: { color: '#999' } },
+      type: yLogCheck.checked ? 'log' : 'linear',
+      gridcolor: '#222', zerolinecolor: '#333',
+      tickfont: { size: 11 },
+      // For log scale, use log10 of slider values (clamped to >= 1 to avoid log(0))
+      // For linear scale, use slider values directly
+      range: yLogCheck.checked ? [Math.log10(Math.max(1, parseInt(minPowerSlider.value))), Math.log10(parseInt(maxPowerSlider.value))] : [parseInt(minPowerSlider.value), parseInt(maxPowerSlider.value)],
+    },
+    margin: { t: 10, r: 20, b: 50, l: 60 },
+    legend: { bgcolor: 'rgba(0,0,0,0)', font: { color: '#ccc', size: 11 }, orientation: 'h', y: 1.08, x: 0 },
+    hovermode: 'x unified',
+    hoverlabel: { bgcolor: '#222', font: { color: '#eee', size: 13 } },
+  };
+
+  // Plotly.react() efficiently updates an existing chart (or creates one)
+  // by comparing the new traces/layout with the previous state.
+  Plotly.react('plot', traces, layout, { responsive: true, displayModeBar: true, modeBarButtonsToRemove: ['lasso2d', 'select2d'], displaylogo: false });
+}
+
+// ──────────────────────────────────────────────────────────────
+// SCREEN MANAGEMENT
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * Switches back to the paste screen and clears the textarea.
+ * Called when user clicks "Change data" or on localStorage failure.
+ */
+function showPaste() {
+  chartScreen.style.display = 'none';
+  pasteScreen.style.display = 'flex';
+  csvInput.value = '';
+  errorMsg.textContent = '';
+  loadBtn.disabled = true;
+}
+
+/**
+ * Parses the given CSV text and transitions to the chart screen.
+ * On success, caches the raw CSV in localStorage for future visits.
+ * On parse error, displays the error message without switching screens.
+ */
+function loadData(text) {
+  try {
+    const data = parseCSV(text);
+    // localStorage can fail in private browsing or when quota is exceeded;
+    // we silently ignore this since the app works without it.
+    try { localStorage.setItem(STORAGE_KEY, text); } catch {}
+    showChart(data);
+  } catch (e) {
+    errorMsg.textContent = e.message;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────
+// EVENT BINDINGS
+// ──────────────────────────────────────────────────────────────
+
+// Enable Load button only when textarea has content
+csvInput.addEventListener('input', () => { loadBtn.disabled = csvInput.value.trim().length === 0; });
+
+// Parse and load on button click
+loadBtn.addEventListener('click', () => loadData(csvInput.value));
+
+// Clear cache and return to paste screen
+changeDataBtn.addEventListener('click', () => { try { localStorage.removeItem(STORAGE_KEY); } catch {} showPaste(); });
+
+// Export chart as 1920x1080 PNG via Plotly's built-in toImage
+exportBtn.addEventListener('click', () => {
+  Plotly.toImage('plot', { format: 'png', width: 1920, height: 1080 }).then(dataUrl => {
+    const a = document.createElement('a');
+    a.href = dataUrl;
+    a.download = 'power-curve.png';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  });
+});
+
+// ──────────────────────────────────────────────────────────────
+// INITIALIZATION
+//
+// On page load, check if cached data exists in localStorage.
+// If so, load it directly (skipping the paste screen).
+// If not (or if localStorage is unavailable), show the paste screen.
+// ──────────────────────────────────────────────────────────────
+let saved;
+try { saved = localStorage.getItem(STORAGE_KEY); } catch { saved = null; }
+if (saved) {
+  loadData(saved);
+}
+</script>
+</body>
+</html>
